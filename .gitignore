@@ -1,0 +1,38 @@
+# autotools
+/aclocal.m4
+/ar-lib
+/autom4te.cache/
+/compile
+/config.guess
+/config.sub
+/config.log
+/config.status
+/configure
+/configure~
+/depcomp
+/install-sh
+/libtool
+/ltmain.sh
+/m4/
+/Makefile
+/Makefile.in
+/missing
+/src/ndpi-plugin-config.h
+/src/ndpi-plugin-config.h.in
+/src/ndpi-plugin-config.h.in~
+/src/stamp-h1
+
+# build output
+*.o
+*.lo
+*.la
+*.so
+.deps/
+.dirstamp
+.libs/
+/src/.deps/
+/src/.libs/
+
+# dist
+/suricata-ndpi-plugin-*.tar.gz
+/suricata-ndpi-plugin-*/

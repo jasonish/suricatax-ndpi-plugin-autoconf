@@ -1,0 +1,230 @@
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Git branch of OISF/suricata to build the plugin against.
+  SURICATA_BRANCH: main-8.0.x
+  NDPI_VERSION: "4.14"
+  SURICATA_PREFIX: /opt/suricata
+  NDPI_PREFIX: /opt/ndpi
+  # Bump to invalidate the Suricata and nDPI build caches.
+  CACHE_VERSION: v1
+
+jobs:
+  # Build and install Suricata (binary, headers and libsuricata-config),
+  # and pass the installation to the plugin jobs as an artifact.
+  suricata:
+    name: Suricata
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Resolve Suricata revision
+        id: source
+        run: |
+          rev=$(git ls-remote https://github.com/OISF/suricata \
+            "refs/heads/${SURICATA_BRANCH}" | cut -f1)
+          if [ -z "$rev" ]; then
+            echo "Branch ${SURICATA_BRANCH} not found" >&2
+            exit 1
+          fi
+          echo "rev=${rev}" >> "$GITHUB_OUTPUT"
+          echo "Suricata ${SURICATA_BRANCH}: ${rev}"
+
+      - name: Prepare install prefix
+        run: |
+          sudo mkdir -p "$SURICATA_PREFIX"
+          sudo chown "$(id -u):$(id -g)" "$SURICATA_PREFIX"
+
+      - name: Cache Suricata installation
+        id: cache
+        uses: actions/cache@v6
+        with:
+          path: ${{ env.SURICATA_PREFIX }}
+          key: suricata-${{ env.CACHE_VERSION }}-ubuntu-24.04-${{ env.SURICATA_BRANCH }}-${{ steps.source.outputs.rev }}
+
+      - name: Install build dependencies
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: ci/install-deps.sh
+
+      - name: Install Rust
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Build and install Suricata
+        if: steps.cache.outputs.cache-hit != 'true'
+        working-directory: ${{ runner.temp }}
+        run: |
+          "$GITHUB_WORKSPACE/ci/build-suricata.sh" \
+            "$SURICATA_BRANCH" "$SURICATA_PREFIX"
+
+      - run: |
+          "$SURICATA_PREFIX/bin/suricata" --build-info | head -n 5
+          "$SURICATA_PREFIX/bin/libsuricata-config" --cflags
+
+      - name: Archive Suricata installation
+        run: tar -C "$(dirname "$SURICATA_PREFIX")" -czf suricata.tar.gz "$(basename "$SURICATA_PREFIX")"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: suricata
+          path: suricata.tar.gz
+          retention-days: 3
+
+  # Build the plugin, then load it into Suricata and run the smoke test.
+  plugin:
+    name: Plugin
+    needs: suricata
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install dependencies
+        run: ci/install-deps.sh
+
+      - name: Prepare install prefixes
+        run: |
+          for d in "$SURICATA_PREFIX" "$NDPI_PREFIX"; do
+            sudo mkdir -p "$d"
+            sudo chown "$(id -u):$(id -g)" "$d"
+          done
+
+      - name: Cache nDPI installation
+        id: cache-ndpi
+        uses: actions/cache@v6
+        with:
+          path: ${{ env.NDPI_PREFIX }}
+          key: ndpi-${{ env.CACHE_VERSION }}-ubuntu-24.04-${{ env.NDPI_VERSION }}-${{ hashFiles('ci/build-ndpi.sh') }}
+
+      - name: Build and install nDPI
+        if: steps.cache-ndpi.outputs.cache-hit != 'true'
+        working-directory: ${{ runner.temp }}
+        run: |
+          "$GITHUB_WORKSPACE/ci/build-ndpi.sh" "$NDPI_VERSION" "$NDPI_PREFIX"
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: suricata
+
+      - name: Extract Suricata installation
+        run: |
+          tar -C "$(dirname "$SURICATA_PREFIX")" -xf suricata.tar.gz
+          rm suricata.tar.gz
+          "$SURICATA_PREFIX/bin/suricata" -V
+
+      - run: ./autogen.sh
+
+      - name: Configure
+        run: |
+          ./configure --enable-warnings \
+            --with-suricata="$SURICATA_PREFIX" \
+            PKG_CONFIG_PATH="$NDPI_PREFIX/lib/pkgconfig"
+
+      - run: make -j "$(nproc)"
+
+      - run: make install
+
+      - name: Smoke test
+        run: |
+          LD_LIBRARY_PATH="$NDPI_PREFIX/lib" tests/smoke-test.sh \
+            "$SURICATA_PREFIX/bin/suricata" \
+            "$SURICATA_PREFIX/lib/suricata/ndpi.so" \
+            "$NDPI_PREFIX/share/ndpi/pcap/http-basic-auth.pcap"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ndpi-plugin-suricata-${{ env.SURICATA_BRANCH }}-ndpi-${{ env.NDPI_VERSION }}
+          path: ${{ env.SURICATA_PREFIX }}/lib/suricata/ndpi.so
+          retention-days: 7
+
+  # Exercise the other ways of locating Suricata and nDPI, and the
+  # distribution tarball.
+  configure-options:
+    name: Configure options
+    needs: suricata
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install dependencies
+        run: ci/install-deps.sh
+
+      - name: Prepare install prefixes
+        run: |
+          for d in "$SURICATA_PREFIX" "$NDPI_PREFIX"; do
+            sudo mkdir -p "$d"
+            sudo chown "$(id -u):$(id -g)" "$d"
+          done
+
+      # Not cached: the source tree is needed for --with-ndpi=<source>.
+      - name: Build and install nDPI
+        run: |
+          ci/build-ndpi.sh "$NDPI_VERSION" "$NDPI_PREFIX" "$RUNNER_TEMP/nDPI"
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: suricata
+
+      - name: Extract Suricata installation
+        run: |
+          tar -C "$(dirname "$SURICATA_PREFIX")" -xf suricata.tar.gz
+          rm suricata.tar.gz
+
+      - run: ./autogen.sh
+
+      - name: libsuricata-config in PATH, static nDPI from pkg-config
+        run: |
+          mkdir build-static && cd build-static
+          PATH="$SURICATA_PREFIX/bin:$PATH" ../configure --enable-warnings \
+            --enable-static-ndpi \
+            PKG_CONFIG_PATH="$NDPI_PREFIX/lib/pkgconfig"
+          make -j "$(nproc)"
+          if ldd .libs/ndpi.so | grep libndpi; then
+            echo "plugin should not depend on libndpi.so" >&2
+            exit 1
+          fi
+          # No LD_LIBRARY_PATH: nDPI is linked into the plugin.
+          ../tests/smoke-test.sh "$SURICATA_PREFIX/bin/suricata" \
+            .libs/ndpi.so "$NDPI_PREFIX/share/ndpi/pcap/http-basic-auth.pcap"
+
+      - name: --with-suricata-config, --with-ndpi=<source tree>
+        run: |
+          mkdir build-ndpi-src && cd build-ndpi-src
+          ../configure --enable-warnings \
+            --with-suricata-config="$SURICATA_PREFIX/bin/libsuricata-config" \
+            --with-ndpi="$RUNNER_TEMP/nDPI"
+          make -j "$(nproc)"
+          ../tests/smoke-test.sh "$SURICATA_PREFIX/bin/suricata" \
+            .libs/ndpi.so "$NDPI_PREFIX/share/ndpi/pcap/http-basic-auth.pcap"
+
+      - name: --with-suricata, --with-ndpi=<prefix>
+        run: |
+          mkdir build-ndpi-prefix && cd build-ndpi-prefix
+          ../configure --enable-warnings \
+            --with-suricata="$SURICATA_PREFIX" \
+            --with-ndpi="$NDPI_PREFIX"
+          make -j "$(nproc)"
+          LD_LIBRARY_PATH="$NDPI_PREFIX/lib" ../tests/smoke-test.sh \
+            "$SURICATA_PREFIX/bin/suricata" .libs/ndpi.so \
+            "$NDPI_PREFIX/share/ndpi/pcap/http-basic-auth.pcap"
+
+      - name: make distcheck
+        run: |
+          mkdir build-dist && cd build-dist
+          ../configure --with-suricata="$SURICATA_PREFIX" \
+            PKG_CONFIG_PATH="$NDPI_PREFIX/lib/pkgconfig"
+          make distcheck \
+            DISTCHECK_CONFIGURE_FLAGS="--with-suricata=$SURICATA_PREFIX PKG_CONFIG_PATH=$NDPI_PREFIX/lib/pkgconfig"
